@@ -1,0 +1,163 @@
+---
+title: "SC Voting Machine Analysis"
+author: "Jacob Spertus and Amanda Glazer"
+date: "9/26/2019"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+Data are in separate tab separated files for each county. Bring them all in as a list and then bind them together into a single data-frame.
+
+```{r load data, message = FALSE}
+file_names <- list.files("zzgeorgia") 
+data_list <- list()
+#read in data with each file as an element of a list
+for(i in 1:length(file_names)){
+  path <- paste("zzgeorgia/", file_names[i], sep = "")
+  data_list[[i]] <- read_delim(path, delim = " ", skip = 1, col_names = FALSE)
+  colnames(data_list[[i]]) <- c("county", "precinct", "dre_machine", "rep_votes", "dem_votes", "frac_rep")
+}
+names(data_list) <- file_names
+
+#convert list into a single dataframe by row binding
+#convert all columns except county to numeric
+data_frame <- data_list %>%
+  reduce(bind_rows) %>% 
+  mutate_at(vars(-county), as.numeric)
+
+data_frame
+```
+
+Analysis follows Kelly Ottoboni's Winterville Train Depot analysis (see [Github repo](https://github.com/pbstark/EvoteID19-GA/blob/master/Rept/Code/winterville.ipynb)). We run the analysis within each precinct (all counties) and then combine using Fisher's combining function. **Question: Is independence justified?**
+
+$$\max_i |R_{im} - R_i|$$
+where $R_{im}$ is the fraction of republican votes cast on machine $m$ and $R_i$ is the overall fraction of republican votes.
+
+```{r permutation test}
+#input: 
+  #votes = matrix of rep (column 1) and dem (column 2) votes
+#output: maximum of difference between each proportion and overall proportion
+test_statistic <- function(votes){
+  r_votes <- votes[,1]
+  d_votes <- votes[,2]
+  prop_rep_m <- r_votes / (d_votes + r_votes)
+  prop_rep_overall <- sum(r_votes) / sum(d_votes + r_votes)
+  differences <- abs(prop_rep_m - prop_rep_overall)
+  
+  max(differences)
+}
+
+
+#randomly allocate votes (keeping total votes for each party and votes within machines fixed) using rmultinom
+#input: 
+  #votes = matrix of rep (column 1) and dem (column 2) votes
+#output:
+  #matrix with columns 'random_r_votes' and 'random_d_votes' that reflect the vote total in each machine (row) if randomly assigned to machines
+randomly_allocate <- function(votes){
+  n_machines <- nrow(votes)
+  r_votes <- votes[,1]
+  d_votes <- votes[,2]
+  #machine_m_votes <- r_votes + d_votes
+  total_votes <- r_votes + d_votes
+  total_r <- sum(r_votes) 
+  total_d <- sum(d_votes)
+  
+  #under the null, all machines have the same proportion of R votes
+  # prop_r_votes <- total_r / total_votes
+  # 
+  # sim_r_votes <- rep(0, length(r_votes))
+  # 
+  # for(i in 1:length(sim_r_votes)){
+  #   sim_r_votes[i] <- rbinom(n = 1, size = machine_m_votes[i], prob = prop_r_votes)
+  # }  
+  # sim_d_votes <- machine_m_votes - sim_r_votes
+  # cbind("random_r_votes" = sim_r_votes, "random_d_votes" = sim_d_votes)
+  # 
+  # make list of total votes with 1 being R vote and 0 being D vote
+  vote_list <- c(rep(1, total_r), rep(0, total_d))
+  # permute the list of votes
+  perm_vote_list <- sample(vote_list, length(vote_list), replace = FALSE)
+  # for each machine get number of D and R votes under perm dist
+  random_r_votes <- rep(0, n_machines)
+  random_d_votes <- rep(0, n_machines)
+  # Track number of votes allocated
+  votes_allocated <- 0
+  for(i in 1:n_machines){
+    random_r_votes[i] <- sum(perm_vote_list[(votes_allocated + 1):(votes_allocated + total_votes[i])])
+    random_d_votes[i] <- total_votes[i] - random_r_votes[i]
+    votes_allocated <- votes_allocated + total_votes[i]
+  }
+  cbind("random_r_votes" = random_r_votes, "random_d_votes" = random_d_votes)
+}
+
+#run permutation test within county and precinct
+#inputs:
+  #votes = matrix of rep (col 1) and dem (col 2) vote counts, with a row for each machine
+  #B = number of permutations to take
+#output: 
+  #p_value = p-value computed as the fraction of times the original test statistic is larger than the test statistic in permutations
+perm_test <- function(votes, B){
+  original_t_stat <- test_statistic(votes)
+  #this creates a list with an element for each random allocation
+  new_vectors <- replicate(n = B, randomly_allocate(votes), simplify = FALSE)
+  permuted_t_stats <- new_vectors %>%
+    map(test_statistic) %>%
+    reduce(c)
+  # Remove permutations that result in NA
+  # P-value is number of permutations that are as or more extreme as sample value 
+  p_value <- mean(original_t_stat <= permuted_t_stats, na.rm = TRUE)
+  p_value
+}
+```
+
+Implement tests on data:
+
+```{r implementation}
+#simple function to create a matrix of r and d votes given a dataframe with those vectors as columns
+create_matrix <- function(data_frame){
+  cbind(data_frame$rep_votes, data_frame$dem_votes)
+}
+
+data_list <- data_frame %>%
+  group_split(county, precinct) %>%
+  map(create_matrix) 
+
+# Remove precincts with only 1 voting machine
+num_machines <- data_list %>%
+  map(nrow)
+data_list <- data_list %>%
+  keep(num_machines != 1)
+
+#this takes about a couple minutes to run
+p_values_each_precinct <- data_list %>%
+  map(perm_test, B = 2000) %>%
+  reduce(c)
+```
+
+Check how many p-values at significance level 0.01 would reject the null. P-values look similar to what we would expect if there are not issues with these BMDs.
+
+```{r test hypothesis}
+sum(p_values_each_precinct < 0.01)/length(p_values_each_precinct)
+```
+
+```{r ecdf}
+plot(ecdf(p_values_each_precinct))
+```
+
+Check that our procedure works by checking with Kellie's Winterville results for Governor. It is very similar - small difference because she had L and W that we didn't consider.
+```{r Winterville}
+winter_gov <- cbind(r = c(40, 51, 60, 68, 65, 65, 51), d = c(73, 79, 67, 59, 67, 78, 82))
+perm_test(winter_gov, 10000)
+```
+
+
+```{r version, include = FALSE}
+R.Version()
+```
+
